@@ -1,0 +1,20 @@
+manifestVersion: 1
+name: "@mgreten/datadog-readonly"
+version: "2026.07.15.1"
+description: >
+  Read-only Datadog incident-context surface — monitors, logs, error events,
+  deploy correlation. No write methods by design. Validate credentials, search
+  logs, pull a service's error events, fetch a monitor's definition and recent
+  alerts, and correlate an incident window against recent deploys and merged PRs
+  to rank change suspects.
+
+repository: https://github.com/meagerfindings/swamp-datadog-readonly
+
+models:
+  - datadog.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.txt
+
+platforms: []
