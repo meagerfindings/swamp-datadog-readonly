@@ -418,6 +418,71 @@ export function rankSuspects(
   return suspects;
 }
 
+/**
+ * Count deploy↔PR joins (deploy SHA == PR merge-commit SHA) across ALL scanned
+ * deploys, independent of the incident window. This is the raw overlap the SHA
+ * join found; it is a diagnostic, not the ranked-suspect count. Zero here while
+ * both scans are non-empty is the classic under-fetch signature — the two
+ * recency-sorted pages simply didn't overlap on any SHA.
+ */
+export function countShaMatches(deploys: DeployRow[], prs: PrRow[]): number {
+  const prShas = new Set<string>();
+  for (const pr of prs) {
+    if (pr.mergeSha) prShas.add(pr.mergeSha);
+  }
+  let n = 0;
+  for (const d of deploys) {
+    if (d.sha && prShas.has(d.sha)) n++;
+  }
+  return n;
+}
+
+/**
+ * Build the under-fetch diagnostic `note` for a correlateDeploys result.
+ *
+ * Returns a non-empty, actionable string when the result smells starved:
+ *   - a fetch page came back exactly full (`count == cap`) — recency-sorted and
+ *     likely truncated, so the SHA-join overlap may be incomplete; or
+ *   - zero SHA matches while BOTH scans were non-empty — the two recency pages
+ *     didn't overlap on any SHA, the hallmark of small-cap starvation.
+ *
+ * Empty string when the result looks healthy (nothing to warn about).
+ */
+export function buildCorrelationNote(d: {
+  deploysScanned: number;
+  prsScanned: number;
+  shaMatches: number;
+  maxDeploys: number;
+  maxPrs: number;
+}): string {
+  const parts: string[] = [];
+  const cappedFetch = d.deploysScanned >= d.maxDeploys ||
+    d.prsScanned >= d.maxPrs;
+  if (cappedFetch) {
+    const which: string[] = [];
+    if (d.deploysScanned >= d.maxDeploys) {
+      which.push(`deploy fetch hit maxDeploys cap (${d.maxDeploys})`);
+    }
+    if (d.prsScanned >= d.maxPrs) {
+      which.push(`PR fetch hit maxPrs cap (${d.maxPrs})`);
+    }
+    parts.push(
+      `${
+        which.join(" and ")
+      } — suspects may be incomplete; retry with larger ` +
+        `maxDeploys/maxPrs or a wider window`,
+    );
+  }
+  if (d.shaMatches === 0 && d.deploysScanned > 0 && d.prsScanned > 0) {
+    parts.push(
+      `0 deploy↔PR SHA matches across ${d.deploysScanned} deploys and ${d.prsScanned} PRs ` +
+        `— the recency-sorted fetches may not overlap; retry with larger ` +
+        `maxDeploys/maxPrs so the SHA join can find the merge commits`,
+    );
+  }
+  return parts.join("; ");
+}
+
 /** Parse `gh api .../deployments` JSON into {@link DeployRow}s. */
 export function parseDeployments(stdout: string): DeployRow[] {
   const raw = JSON.parse(stdout) as Array<
@@ -522,6 +587,29 @@ const CorrelateDeploysResultSchema = z.object({
   windowMinutes: z.number().int(),
   deployCount: z.number().int(),
   prCount: z.number().int(),
+  // ── Under-fetch diagnostics (additive; backward compatible) ──────────
+  // A recency-sorted deploy/PR pull with small caps can under-fetch the
+  // deploy↔PR SHA-join overlap and return `suspects: []` even when correlated
+  // deploys exist. These fields make an empty/truncated result explainable
+  // rather than silently ambiguous during an incident.
+  deploysScanned: z.number().int().describe(
+    "Deploy rows returned by the gh fetch (== deployCount; the raw scan size).",
+  ),
+  prsScanned: z.number().int().describe(
+    "Merged-PR rows returned by the gh fetch (== prCount; the raw scan size).",
+  ),
+  shaMatches: z.number().int().describe(
+    "Count of deploy↔PR joins found (deploy SHA == PR merge-commit SHA), " +
+      "across ALL scanned deploys — before window filtering.",
+  ),
+  deploysInWindow: z.number().int().describe(
+    "Deploys that fell inside the [incidentStart - windowMinutes, incidentStart] " +
+      "window (== suspects.length; the deploys actually ranked).",
+  ),
+  note: z.string().describe(
+    "Non-empty when the result smells under-fetched (a fetch hit its cap, or " +
+      "zero SHA matches while both scans were non-empty). Empty when healthy.",
+  ),
   suspects: z.array(z.object({
     sha: z.string(),
     deployedAt: z.string().nullable(),
@@ -973,6 +1061,20 @@ export async function runCorrelateDeploys(
     args.windowMinutes,
   );
 
+  // Under-fetch diagnostics: the SHA join joins recency-sorted deploy/PR pages,
+  // so small caps can starve the overlap and yield `suspects: []` even when
+  // correlated deploys exist. Surface the scan sizes, the raw SHA-match count,
+  // the in-window count, and an actionable note so an empty result is
+  // explainable rather than silently ambiguous.
+  const shaMatches = countShaMatches(deploys, prs);
+  const note = buildCorrelationNote({
+    deploysScanned: deploys.length,
+    prsScanned: prs.length,
+    shaMatches,
+    maxDeploys: args.maxDeploys,
+    maxPrs: args.maxPrs,
+  });
+
   return {
     ok: true,
     ts: new Date(now).toISOString(),
@@ -982,6 +1084,11 @@ export async function runCorrelateDeploys(
     windowMinutes: args.windowMinutes,
     deployCount: deploys.length,
     prCount: prs.length,
+    deploysScanned: deploys.length,
+    prsScanned: prs.length,
+    shaMatches,
+    deploysInWindow: suspects.length,
+    note,
     suspects,
   };
 }
@@ -993,7 +1100,7 @@ export async function runCorrelateDeploys(
  */
 export const model = {
   type: "@mgreten/datadog-readonly",
-  version: "2026.07.15.2",
+  version: "2026.07.15.3",
   globalArguments: GlobalArgsSchema,
   resources: {
     monitor_context: {
@@ -1135,13 +1242,20 @@ export const model = {
           incidentStart: args.incidentStart,
           deployCount: record.deployCount,
           prCount: record.prCount,
+          shaMatches: record.shaMatches,
           suspectCount: record.suspects.length,
+          note: record.note,
         });
         const handle = await context.writeResource(
           "deploy_correlation",
           `deploys-${record.ts}`,
           record,
-          { tags: { suspectCount: String(record.suspects.length) } },
+          {
+            tags: {
+              suspectCount: String(record.suspects.length),
+              underFetched: String(record.note !== ""),
+            },
+          },
         );
         return { dataHandles: [handle] };
       },

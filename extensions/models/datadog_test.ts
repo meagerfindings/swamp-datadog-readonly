@@ -6,9 +6,11 @@ import {
 } from "jsr:@std/assert@1";
 import {
   apiBase,
+  buildCorrelationNote,
   buildLogQuery,
   buildLogsBody,
   buildMonitorEventsBody,
+  countShaMatches,
   ddHeaders,
   type FetchLike,
   type GhRunner,
@@ -479,6 +481,127 @@ Deno.test("rankSuspects: skips undate-parseable deploys", () => {
   assertEquals(rankSuspects(deploys, [], INCIDENT), []);
 });
 
+// ── under-fetch diagnostics (countShaMatches / buildCorrelationNote) ──
+
+Deno.test("countShaMatches: counts deploy↔PR SHA joins across all scanned rows", () => {
+  const deploys = [
+    { sha: "aaa", createdAt: "2026-07-14T20:00:00Z", ref: "aaa" },
+    { sha: "bbb", createdAt: "2026-07-14T19:00:00Z", ref: "bbb" },
+    { sha: "ccc", createdAt: "2026-07-14T18:00:00Z", ref: "ccc" },
+  ];
+  const prs = [
+    {
+      number: 1,
+      title: "one",
+      author: "a",
+      mergedAt: "2026-07-14T20:00:00Z",
+      mergeSha: "aaa",
+    },
+    {
+      number: 2,
+      title: "two",
+      author: "b",
+      mergedAt: "2026-07-14T18:00:00Z",
+      mergeSha: "ccc",
+    },
+  ];
+  // aaa and ccc join; bbb does not — independent of any window.
+  assertEquals(countShaMatches(deploys, prs), 2);
+});
+
+Deno.test("countShaMatches: zero when recency pages don't overlap on any SHA", () => {
+  const deploys = [
+    { sha: "d1", createdAt: "2026-07-14T20:00:00Z", ref: "d1" },
+    { sha: "d2", createdAt: "2026-07-14T19:00:00Z", ref: "d2" },
+  ];
+  const prs = [{
+    number: 9,
+    title: "p",
+    author: "a",
+    mergedAt: "2026-07-14T10:00:00Z",
+    mergeSha: "p9", // no deploy carries this SHA
+  }];
+  assertEquals(countShaMatches(deploys, prs), 0);
+  // Empty-scan edge cases.
+  assertEquals(countShaMatches([], prs), 0);
+  assertEquals(countShaMatches(deploys, []), 0);
+});
+
+Deno.test("buildCorrelationNote: full-page truncation note fires when a fetch hits its cap", () => {
+  // deploy page came back exactly full (15 == maxDeploys) → likely truncated.
+  const note = buildCorrelationNote({
+    deploysScanned: 15,
+    prsScanned: 10,
+    shaMatches: 3,
+    maxDeploys: 15,
+    maxPrs: 25,
+  });
+  assert(note.length > 0, "note is non-empty on a full page");
+  assert(note.includes("maxDeploys"), "names the capped arg");
+  assert(note.includes("15"), "reports the cap value");
+  assert(
+    note.includes("retry with larger"),
+    "carries the actionable remediation",
+  );
+  // The PR page (10 < 25) did NOT hit its cap → not named.
+  assert(!note.includes("maxPrs cap"), "does not warn about the uncapped PR page");
+});
+
+Deno.test("buildCorrelationNote: names both caps when both pages are full", () => {
+  const note = buildCorrelationNote({
+    deploysScanned: 15,
+    prsScanned: 25,
+    shaMatches: 5,
+    maxDeploys: 15,
+    maxPrs: 25,
+  });
+  assert(note.includes("maxDeploys cap (15)"), "names the deploy cap");
+  assert(note.includes("maxPrs cap (25)"), "names the PR cap");
+});
+
+Deno.test("buildCorrelationNote: zero-match note fires when both scans non-empty but no SHA join", () => {
+  // Neither page is full (below caps) but the join found nothing.
+  const note = buildCorrelationNote({
+    deploysScanned: 12,
+    prsScanned: 20,
+    shaMatches: 0,
+    maxDeploys: 50,
+    maxPrs: 50,
+  });
+  assert(note.length > 0, "note is non-empty on a zero-match starve");
+  assert(note.includes("0 deploy↔PR SHA matches"), "explains the zero overlap");
+  assert(note.includes("12 deploys and 20 PRs"), "reports both scan sizes");
+  assert(note.includes("retry with larger"), "carries remediation");
+});
+
+Deno.test("buildCorrelationNote: healthy case has empty note", () => {
+  // Neither page full, and the join found matches → nothing to warn about.
+  assertEquals(
+    buildCorrelationNote({
+      deploysScanned: 12,
+      prsScanned: 20,
+      shaMatches: 4,
+      maxDeploys: 50,
+      maxPrs: 50,
+    }),
+    "",
+  );
+});
+
+Deno.test("buildCorrelationNote: zero matches with an empty scan is NOT flagged", () => {
+  // A genuinely empty deploy scan is not an under-fetch smell — no PRs to miss.
+  assertEquals(
+    buildCorrelationNote({
+      deploysScanned: 0,
+      prsScanned: 20,
+      shaMatches: 0,
+      maxDeploys: 50,
+      maxPrs: 50,
+    }),
+    "",
+  );
+});
+
 // ── HTTP method wrappers (with stubbed fetch) ─────────────────────────
 
 Deno.test("runMonitorContext: v1 monitor def + v2 events search, parses response", async () => {
@@ -682,6 +805,55 @@ Deno.test("runCorrelateDeploys: joins gh deployments+PRs and ranks", async () =>
   assertEquals(rec.suspects[0].sha, "8bbdc1d");
   assertEquals(rec.suspects[0].prNumber, 25027);
   assertEquals(rec.suspects[0].prAuthor, "octocat");
+  // Diagnostics: scans (2 deploys / 1 PR) are below the 50 caps, and the SHA
+  // join found 8bbdc1d across all scanned rows → healthy, empty note.
+  assertEquals(rec.deploysScanned, 2);
+  assertEquals(rec.prsScanned, 1);
+  assertEquals(rec.shaMatches, 1);
+  assertEquals(rec.deploysInWindow, 1);
+  assertEquals(rec.note, "");
+});
+
+Deno.test("runCorrelateDeploys: full deploy page → truncation note, empty suspects explained", async () => {
+  const now = Date.parse("2026-07-14T22:00:00Z");
+  // Return exactly maxDeploys (2) deploy rows, both OUTSIDE the window and none
+  // matching the PR SHA — the small-cap under-fetch shape. suspects is empty,
+  // but the note must explain the truncation rather than leave it ambiguous.
+  const gh: GhRunner = (args) => {
+    if (args[0] === "api") {
+      return Promise.resolve({
+        ok: true,
+        stdout: JSON.stringify([
+          { sha: "z1", created_at: "2026-07-14T10:00:00Z", ref: "z1" },
+          { sha: "z2", created_at: "2026-07-14T09:00:00Z", ref: "z2" },
+        ]),
+      });
+    }
+    return Promise.resolve({
+      ok: true,
+      stdout: JSON.stringify([{
+        number: 42,
+        title: "Unrelated",
+        author: { login: "carol" },
+        mergedAt: "2026-07-14T08:00:00Z",
+        mergeCommit: { oid: "nomatch" },
+      }]),
+    });
+  };
+  const rec = await runCorrelateDeploys(gh, g(), {
+    incidentStart: "2026-07-14T21:00:00Z",
+    windowMinutes: 90,
+    maxDeploys: 2, // page comes back exactly full → truncation smell
+    maxPrs: 50,
+  }, now);
+  assertEquals(rec.suspects.length, 0);
+  assertEquals(rec.deploysInWindow, 0);
+  assertEquals(rec.deploysScanned, 2);
+  assertEquals(rec.shaMatches, 0);
+  assert(rec.note.length > 0, "empty suspects is explained, not silent");
+  assert(rec.note.includes("maxDeploys"), "note names the capped fetch");
+  // Zero-match clause ALSO fires (both scans non-empty, no SHA overlap).
+  assert(rec.note.includes("0 deploy↔PR SHA matches"), "zero-match clause fires");
 });
 
 Deno.test("runCorrelateDeploys: uses configured githubRepo + deployEnvironment", async () => {

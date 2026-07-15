@@ -164,6 +164,51 @@ Proxies an error-tracking view through the v2 logs-search endpoint: it forces
 | `maxDeploys`   | int    | `50`    | Recent deployments to pull (max 200).                        |
 | `maxPrs`       | int    | `50`    | Recent merged PRs to pull (max 200).                         |
 
+### correlateDeploys diagnostics (`deploy_correlation` resource)
+
+`correlateDeploys` joins two **recency-sorted** GitHub pages — the most-recent
+`maxDeploys` deployments and the most-recent `maxPrs` merged PRs — on
+`deploy SHA == PR merge-commit SHA`. **Small caps can starve that join:** if the
+two pages don't overlap on any SHA (or a page is truncated before the correlated
+deploy appears), the ranked `suspects` list can come back **empty even when
+correlated deploys exist in-window**. That empty result used to be
+indistinguishable from "genuinely no correlated deploys" — during an incident
+that silent ambiguity is dangerous.
+
+Every `correlateDeploys` result now carries additive diagnostics so an
+empty/thin result is **explainable, not silently ambiguous**:
+
+| Field             | Meaning                                                                                          |
+| ----------------- | ------------------------------------------------------------------------------------------------ |
+| `deploysScanned`  | Deploy rows the gh fetch returned (the raw scan size; == `deployCount`).                          |
+| `prsScanned`      | Merged-PR rows the gh fetch returned (== `prCount`).                                              |
+| `shaMatches`      | Count of deploy↔PR SHA joins found across **all** scanned deploys, before window filtering.       |
+| `deploysInWindow` | Deploys that fell inside the window and were ranked (== `suspects.length`).                        |
+| `note`            | Non-empty when the result smells under-fetched; empty when healthy. See below.                    |
+
+`note` fires (with an actionable "retry with larger maxDeploys/maxPrs or a wider
+window" hint) when either:
+
+- **a fetch page came back exactly full** (`deploysScanned == maxDeploys` or
+  `prsScanned == maxPrs`) — the page is recency-sorted and likely truncated
+  before the correlated change, e.g. `deploy fetch hit maxDeploys cap (15) —
+  suspects may be incomplete; …`; or
+- **zero SHA matches while both scans were non-empty** — the two recency pages
+  didn't overlap on any SHA, the hallmark of small-cap starvation.
+
+A healthy result (neither page full, SHA join found matches) has `note: ""`.
+The `deploy_correlation` resource is also tagged `underFetched: "true"|"false"`
+so a CEL consumer can filter on it.
+
+**Operational lesson (found in a live incident scout):** with
+`windowMinutes=90 maxDeploys=15 maxPrs=25` the method returned `suspects: []`
+for an incident that the **default** `180/50/50` params correctly attributed to
+11 suspects. The small caps under-fetched the deploy↔PR overlap. The fix is
+**diagnostics, not a hidden fetch floor**: the caps are still honored exactly
+(no surprise over-fetch, no rejected-below-a-floor error), but a starved result
+now says so and tells you to widen. Prefer the defaults for incident scouting;
+if you must cap tight, read `note` before concluding "no suspects."
+
 ## How It Works
 
 - **Auth** is header-based (`DD-API-KEY` + `DD-APPLICATION-KEY`). The model
@@ -182,7 +227,11 @@ Proxies an error-tracking view through the v2 logs-search endpoint: it forces
   `gh pr list`), joins deploys to PRs on `deploy SHA == PR merge-commit SHA`,
   and ranks suspects by a deterministic linear proximity decay over the window
   (a SHA-matched PR gets a +0.5 boost; ties break by SHA). It requires `gh` on
-  the host but needs no Datadog auth.
+  the host but needs no Datadog auth. Because the join is over two recency-sorted
+  pages, small caps can starve it — the result carries `deploysScanned`,
+  `prsScanned`, `shaMatches`, `deploysInWindow`, and a `note` that explains an
+  empty/thin result rather than leaving it silently ambiguous (see the
+  correlateDeploys diagnostics table above).
 
 ## License
 
