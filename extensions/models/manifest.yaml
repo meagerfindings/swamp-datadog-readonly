@@ -1,6 +1,6 @@
 manifestVersion: 1
 name: "@mgreten/datadog-readonly"
-version: "2026.07.15.1"
+version: "2026.07.15.2"
 description: >
   Read-only Datadog incident-context surface — monitors, logs, error events,
   deploy correlation. No write methods by design. Validate credentials, search

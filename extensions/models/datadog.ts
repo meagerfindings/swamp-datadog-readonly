@@ -699,16 +699,51 @@ type DdMonitor = {
   tags?: string[];
 };
 
-/** A raw v1 event as returned by the Datadog events endpoint. */
+/**
+ * A raw v2 event row as returned by `POST /api/v2/events/search`.
+ *
+ * Monitor state-transition ("alert") events live in the Events Explorer under
+ * `source:alert`. The transition kind (Triggered / Recovered / Warn / …) and
+ * the human title are carried in the free-form `attributes.attributes` bag;
+ * Datadog is inconsistent about exactly which keys are populated per event, so
+ * {@link parseEventsResponse} reads several candidates defensively.
+ */
 type DdEvent = {
-  id?: number | string;
-  title?: string;
-  text?: string;
-  alert_type?: string;
-  date_happened?: number;
+  id?: string;
+  type?: string;
+  attributes?: {
+    timestamp?: string | number;
+    message?: string;
+    tags?: string[];
+    attributes?: {
+      title?: string;
+      status?: string;
+      alert_type?: string;
+      evt?: { type?: string };
+      monitor?: { id?: number | string; result?: { alert_type?: string } };
+      aggregation_key?: string;
+      [k: string]: unknown;
+    };
+  };
 };
 
-/** Flatten the v1 events response into our event row schema. */
+/** Coerce a v2 event timestamp (ISO string or epoch millis) to an ISO string. */
+function toIso(ts: string | number | undefined): string {
+  if (ts === undefined || ts === null || ts === "") return "";
+  if (typeof ts === "number") return new Date(ts).toISOString();
+  // Numeric-looking string => epoch millis; otherwise assume ISO already.
+  if (/^\d+$/.test(ts)) return new Date(Number(ts)).toISOString();
+  const parsed = Date.parse(ts);
+  return Number.isNaN(parsed) ? ts : new Date(parsed).toISOString();
+}
+
+/**
+ * Flatten a v2 events-search response into our event row schema.
+ *
+ * `alertType` is the state transition (`error`/`recovery`/`warning`/…); we read
+ * it from whichever of the documented locations Datadog populated. `title`
+ * falls back to the message when no explicit title is present.
+ */
 export function parseEventsResponse(body: unknown): Array<{
   id: number | string | null;
   title: string;
@@ -716,16 +751,47 @@ export function parseEventsResponse(body: unknown): Array<{
   alertType: string;
   dateHappened: string;
 }> {
-  const events = (body as { events?: DdEvent[] })?.events ?? [];
-  return events.map((e) => ({
-    id: e.id ?? null,
-    title: e.title ?? "",
-    text: e.text ?? "",
-    alertType: e.alert_type ?? "",
-    dateHappened: e.date_happened
-      ? new Date(e.date_happened * 1000).toISOString()
-      : "",
-  }));
+  const data = (body as { data?: DdEvent[] })?.data ?? [];
+  return data.map((d) => {
+    const attrs = d.attributes ?? {};
+    const inner = attrs.attributes ?? {};
+    const alertType = inner.status ?? inner.alert_type ??
+      inner.monitor?.result?.alert_type ?? "";
+    const message = attrs.message ?? "";
+    return {
+      id: d.id ?? null,
+      title: inner.title ?? message,
+      text: message,
+      alertType,
+      dateHappened: toIso(attrs.timestamp),
+    };
+  });
+}
+
+/**
+ * Build the `POST /api/v2/events/search` request body scoped to one monitor's
+ * state-transition (alert) events in a window.
+ *
+ * The v1 `/api/v1/events?tags=monitor:<id>` query this replaced returned
+ * nothing: `monitor:<id>` is not a real event tag, so it silently matched no
+ * events even while the monitor was flapping. The Events Explorer surfaces
+ * monitor transitions under `source:alert`, keyed by `@monitor.id`.
+ */
+export function buildMonitorEventsBody(
+  monitorId: number,
+  fromMs: number,
+  toMs: number,
+  limit = 100,
+): Record<string, unknown> {
+  return {
+    filter: {
+      query: `source:alert @monitor.id:${monitorId}`,
+      from: new Date(fromMs).toISOString(),
+      to: new Date(toMs).toISOString(),
+    },
+    sort: "timestamp",
+    page: { limit },
+  };
 }
 
 /** Fetch a monitor definition plus its recent events in a window. */
@@ -742,14 +808,17 @@ export async function runMonitorContext(
     `/api/v1/monitor/${args.monitorId}`,
   )) as DdMonitor;
 
-  // Pull recent monitor events (state transitions / alerts) from the v1 events
-  // stream, scoped to this monitor and window.
-  const fromS = Math.floor(win.fromMs / 1000);
-  const toS = Math.floor(win.toMs / 1000);
+  // Pull recent monitor state-transition (alert) events from the v2 events
+  // search API, scoped to this monitor and window. See buildMonitorEventsBody
+  // for why the old v1 `tags=monitor:<id>` query returned nothing.
   const eventsBody = await ddRequest(
     fetchImpl,
     g,
-    `/api/v1/events?start=${fromS}&end=${toS}&tags=monitor:${args.monitorId}`,
+    "/api/v2/events/search",
+    {
+      method: "POST",
+      body: buildMonitorEventsBody(args.monitorId, win.fromMs, win.toMs),
+    },
   );
   const events = parseEventsResponse(eventsBody);
 
@@ -924,7 +993,7 @@ export async function runCorrelateDeploys(
  */
 export const model = {
   type: "@mgreten/datadog-readonly",
-  version: "2026.07.15.1",
+  version: "2026.07.15.2",
   globalArguments: GlobalArgsSchema,
   resources: {
     monitor_context: {

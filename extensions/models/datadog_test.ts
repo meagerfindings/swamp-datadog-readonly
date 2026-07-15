@@ -8,6 +8,7 @@ import {
   apiBase,
   buildLogQuery,
   buildLogsBody,
+  buildMonitorEventsBody,
   ddHeaders,
   type FetchLike,
   type GhRunner,
@@ -264,23 +265,66 @@ Deno.test("parseErrorLogsResponse: extracts nested error.kind", () => {
   assertEquals(errs[0].message, "NoMethodError");
 });
 
-Deno.test("parseEventsResponse: converts epoch seconds to ISO", () => {
+Deno.test("parseEventsResponse: flattens v2 event rows (ISO timestamp)", () => {
   const events = parseEventsResponse({
-    events: [{
-      id: 42,
-      title: "Triggered",
-      text: "monitor fired",
-      alert_type: "error",
-      date_happened: 1_768_392_000, // 2026-01-14T12:00:00Z
+    data: [{
+      id: "AAAA",
+      type: "event",
+      attributes: {
+        timestamp: "2026-07-14T21:37:43Z",
+        message: "Triggered: Sidekiq Retry Queue Is High",
+        tags: ["env:production"],
+        attributes: {
+          title: "[Triggered] Sidekiq Retry Queue Is High",
+          status: "error",
+          monitor: { id: 69569080 },
+        },
+      },
     }],
   });
   assertEquals(events.length, 1);
-  assertEquals(events[0].id, 42);
+  assertEquals(events[0].id, "AAAA");
   assertEquals(events[0].alertType, "error");
-  assertEquals(
-    events[0].dateHappened,
-    new Date(1_768_392_000 * 1000).toISOString(),
-  );
+  assertEquals(events[0].title, "[Triggered] Sidekiq Retry Queue Is High");
+  assertEquals(events[0].dateHappened, "2026-07-14T21:37:43.000Z");
+});
+
+Deno.test("parseEventsResponse: reads epoch-millis timestamp + alert_type fallback", () => {
+  const events = parseEventsResponse({
+    data: [{
+      id: "BBBB",
+      attributes: {
+        timestamp: 1784065360000, // 2026-07-14T21:42:40Z
+        message: "Recovered",
+        attributes: { alert_type: "recovery" },
+      },
+    }],
+  });
+  assertEquals(events.length, 1);
+  assertEquals(events[0].alertType, "recovery");
+  // title falls back to message when no explicit title is present
+  assertEquals(events[0].title, "Recovered");
+  assertEquals(events[0].dateHappened, new Date(1784065360000).toISOString());
+});
+
+Deno.test("parseEventsResponse: empty on missing data array", () => {
+  assertEquals(parseEventsResponse({}).length, 0);
+  assertEquals(parseEventsResponse({ data: [] }).length, 0);
+});
+
+Deno.test("buildMonitorEventsBody: v2 search body scoped to monitor alerts", () => {
+  const from = Date.parse("2026-07-14T12:55:00Z");
+  const to = Date.parse("2026-07-15T00:55:00Z");
+  const body = buildMonitorEventsBody(69569080, from, to) as {
+    filter: { query: string; from: string; to: string };
+    sort: string;
+    page: { limit: number };
+  };
+  assertEquals(body.filter.query, "source:alert @monitor.id:69569080");
+  assertEquals(body.filter.from, new Date(from).toISOString());
+  assertEquals(body.filter.to, new Date(to).toISOString());
+  assertEquals(body.sort, "timestamp");
+  assertEquals(body.page.limit, 100);
 });
 
 Deno.test("parseDeployments: filters rows without sha", () => {
@@ -437,12 +481,12 @@ Deno.test("rankSuspects: skips undate-parseable deploys", () => {
 
 // ── HTTP method wrappers (with stubbed fetch) ─────────────────────────
 
-Deno.test("runMonitorContext: builds monitor + events requests, parses response", async () => {
+Deno.test("runMonitorContext: v1 monitor def + v2 events search, parses response", async () => {
   const now = Date.parse("2026-07-14T12:00:00Z");
-  // First call → monitor, second → events. Use a stub that switches on path.
-  const calls: string[] = [];
+  // First call → monitor def (v1 GET), second → events (v2 POST search).
+  const calls: Array<{ url: string; method?: string; body?: string }> = [];
   const fetchImpl: FetchLike = (url, init) => {
-    calls.push(url);
+    calls.push({ url, method: init?.method, body: init?.body });
     assertEquals(init?.headers?.["DD-API-KEY"], "api-123");
     if (url.includes("/api/v1/monitor/")) {
       return Promise.resolve({
@@ -460,18 +504,30 @@ Deno.test("runMonitorContext: builds monitor + events requests, parses response"
           })),
       });
     }
+    // v2 events search response
     return Promise.resolve({
       ok: true,
       status: 200,
       text: () =>
         Promise.resolve(JSON.stringify({
-          events: [{
-            id: 1,
-            title: "Triggered",
-            text: "fired",
-            alert_type: "error",
-            date_happened: 1_768_392_000,
-          }],
+          data: [
+            {
+              id: "E1",
+              attributes: {
+                timestamp: "2026-07-14T21:37:43Z",
+                message: "Triggered",
+                attributes: { status: "error", monitor: { id: 777 } },
+              },
+            },
+            {
+              id: "E2",
+              attributes: {
+                timestamp: "2026-07-14T21:43:43Z",
+                message: "Recovered",
+                attributes: { status: "success", monitor: { id: 777 } },
+              },
+            },
+          ],
         })),
     });
   };
@@ -480,10 +536,16 @@ Deno.test("runMonitorContext: builds monitor + events requests, parses response"
   assertEquals(rec.monitorId, 777);
   assertEquals(rec.overallState, "Alert");
   assertEquals(rec.tags, ["service:api", "team:core"]);
-  assertEquals(rec.eventCount, 1);
-  assert(calls[0].startsWith("https://api.datadoghq.com/api/v1/monitor/777"));
-  assert(calls[1].includes("tags=monitor:777"));
-  assert(calls[1].includes("https://api.datadoghq.com/api/v1/events"));
+  assertEquals(rec.eventCount, 2);
+  assertEquals(rec.events[0].alertType, "error");
+  assertEquals(rec.events[1].alertType, "success");
+  // v1 monitor definition GET
+  assert(calls[0].url.startsWith("https://api.datadoghq.com/api/v1/monitor/777"));
+  // v2 events search POST scoped to the monitor's alert events
+  assertEquals(calls[1].url, "https://api.datadoghq.com/api/v2/events/search");
+  assertEquals(calls[1].method, "POST");
+  const evBody = JSON.parse(calls[1].body ?? "{}");
+  assertEquals(evBody.filter.query, "source:alert @monitor.id:777");
 });
 
 Deno.test("runSearchLogs: POSTs to v2 search with facet-joined query", async () => {

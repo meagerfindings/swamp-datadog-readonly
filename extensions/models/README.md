@@ -174,7 +174,10 @@ Proxies an error-tracking view through the v2 logs-search endpoint: it forces
   (`POST /api/v2/logs/events/search`). `errorEvents` is `searchLogs` with a
   forced `status:error` filter — an error-tracking proxy, not a distinct API.
 - **Monitor context** reads `GET /api/v1/monitor/<id>` for the definition and
-  `GET /api/v1/events` (tagged `monitor:<id>`) for recent state transitions.
+  `POST /api/v2/events/search` (query `source:alert @monitor.id:<id>`) for the
+  monitor's recent state-transition (alert) events. The older
+  `GET /api/v1/events?tags=monitor:<id>` query returned nothing —
+  `monitor:<id>` is not a real event tag — so transitions were silently missed.
 - **correlateDeploys** shells out to the `gh` CLI (`gh api .../deployments` and
   `gh pr list`), joins deploys to PRs on `deploy SHA == PR merge-commit SHA`,
   and ranks suspects by a deterministic linear proximity decay over the window
