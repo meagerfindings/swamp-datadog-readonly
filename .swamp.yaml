@@ -1,7 +1,7 @@
-swampVersion: 20260727.000815.0
-initializedAt: '2026-07-14T23:24:34.392Z'
+swampVersion: 20261014.204224.0
+initializedAt: "2026-07-14T23:24:34.392Z"
 repoId: fed3d142-b090-4235-baeb-e70625939ce3
 tools:
   - claude
 gitignoreManaged: true
-upgradedAt: '2026-07-27T01:42:58.281Z'
+upgradedAt: "2026-10-14T22:05:25.589Z"
